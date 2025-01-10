@@ -11,7 +11,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
 # Load MATLAB data
-mat_data = scipy.io.loadmat(r"E:\Rutwik\Research\Hyperspectral unmixing\Project\Final Project\Datasets synthetic\5e128x128SphericGFDefaultSNR80.mat")
+mat_data = scipy.io.loadmat("datapath")
 
 # Extract data
 hyperspectral_data = mat_data['syntheticImageNoisy']  # Shape: (128, 128, 431)
