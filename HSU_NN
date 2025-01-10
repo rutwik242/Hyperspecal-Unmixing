@@ -1,0 +1,113 @@
+import scipy.io
+import numpy as np
+import torch
+from torch.utils.data import Dataset, DataLoader
+import torch.nn as nn
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+
+# Check GPU availability
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+# Load MATLAB data
+mat_data = scipy.io.loadmat(r"E:\Rutwik\Research\Hyperspectral unmixing\Project\Final Project\Datasets synthetic\5e128x128SphericGFDefaultSNR80.mat")
+
+# Extract data
+hyperspectral_data = mat_data['syntheticImageNoisy']  # Shape: (128, 128, 431)
+abundance_gt = mat_data['abundanciesGT']  # Shape: (128, 128, 5)
+endmembers_gt = mat_data['endmembersGT']  # Shape: (5, 431)
+
+# Normalize data
+hyperspectral_data = hyperspectral_data / np.max(hyperspectral_data)
+abundance_gt = abundance_gt / np.max(abundance_gt)
+endmembers_gt = endmembers_gt / np.max(endmembers_gt)
+
+print("Hyperspectral Data Shape:", hyperspectral_data.shape)
+print("Abundance Ground Truth Shape:", abundance_gt.shape)
+print("Endmember Ground Truth Shape:", endmembers_gt.shape)
+
+
+class HyperspectralDataset(Dataset):
+    def __init__(self, hyperspectral_data, abundance_gt, endmembers_gt):
+        self.hyperspectral_data = hyperspectral_data
+        self.abundance_gt = torch.tensor(abundance_gt, dtype=torch.float32).to(device)
+        self.endmembers_gt = torch.tensor(endmembers_gt, dtype=torch.float32).to(device)
+
+    def __len__(self):
+        return 1  # Only one image
+
+    def __getitem__(self, idx):
+        hyperspectral_tensor = torch.tensor(self.hyperspectral_data.transpose(2, 0, 1), dtype=torch.float32).to(device)
+        abundance_gt_tensor = self.abundance_gt.permute(2, 0, 1)  # Shape: (num_endmembers, x, y)
+        endmembers_gt_tensor = self.endmembers_gt  # Shape: (num_endmembers, bands)
+        return hyperspectral_tensor, abundance_gt_tensor, endmembers_gt_tensor
+
+# Initialize dataset and dataloader
+dataset = HyperspectralDataset(hyperspectral_data, abundance_gt, endmembers_gt)
+dataloader = DataLoader(dataset, batch_size=1, shuffle=False)
+
+print("Dataset and DataLoader initialized.")
+
+
+class HyperspectralUnmixingModel(nn.Module):
+    def __init__(self, num_bands, num_endmembers):
+        super(HyperspectralUnmixingModel, self).__init__()
+
+        # Shared convolutional layers
+        self.shared_conv = nn.Sequential(
+            nn.Conv2d(in_channels=num_bands, out_channels=64, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(in_channels=64, out_channels=128, kernel_size=3, padding=1),
+            nn.ReLU()
+        )
+
+        # Abundance Prediction Branch
+        self.abundance_branch = nn.Sequential(
+            nn.Conv2d(in_channels=128, out_channels=num_endmembers, kernel_size=1),
+            nn.Softmax(dim=1)  # Normalize abundances across endmembers
+        )
+
+        # Signature Prediction Branch
+        self.signature_branch = nn.Sequential(
+            nn.AdaptiveAvgPool2d((1, 1)),  # Global pooling to aggregate features
+            nn.Flatten(),
+            nn.Linear(128, num_endmembers * num_bands),
+            nn.Sigmoid()  # Normalized signatures
+        )
+
+    def forward(self, x):
+        shared_features = self.shared_conv(x)
+
+        # Abundance prediction
+        abundances = self.abundance_branch(shared_features)
+
+        # Signature prediction
+        signatures = self.signature_branch(shared_features)
+        signatures = signatures.view(-1, num_endmembers, num_bands)
+
+        return signatures, abundances
+
+# Model initialization
+num_bands = hyperspectral_data.shape[2]
+num_endmembers = endmembers_gt.shape[0]
+model = HyperspectralUnmixingModel(num_bands=num_bands, num_endmembers=num_endmembers).to(device)
+
+print("Model initialized.")
+
+# Abundance loss (MSE)
+criterion_abundance = lambda output, target: torch.sqrt(nn.MSELoss()(output, target))
+
+# Spectral Angle Distance (SAD) loss
+def spectral_angle_distance(pred_signatures, gt_signatures):
+    
+    dot_product = torch.sum(pred_signatures * gt_signatures, dim=-1)
+    norm_pred = torch.norm(pred_signatures, dim=-1)
+    norm_gt = torch.norm(gt_signatures, dim=-1)
+    sad = torch.acos(dot_product / (norm_pred * norm_gt + 1e-6))  # Avoid division by zero.
+    return sad  # Returns SAD per sample (not averaged).
+
+
+# Optimizer
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
